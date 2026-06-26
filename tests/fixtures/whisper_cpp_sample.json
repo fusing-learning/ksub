@@ -1,0 +1,22 @@
+{
+  "transcription": [
+    {
+      "timestamps": {"from": "00:00:00.000", "to": "00:00:02.500"},
+      "offsets": {"from": 0, "to": 250},
+      "text": " 안녕하세요 여러분",
+      "words": [
+        {"word": " 안녕하세요", "t0": 0, "t1": 120},
+        {"word": " 여러분", "t0": 130, "t1": 250}
+      ]
+    },
+    {
+      "timestamps": {"from": "00:00:03.000", "to": "00:00:05.000"},
+      "offsets": {"from": 300, "to": 500},
+      "text": " 반갑습니다",
+      "tokens": [
+        {"text": " 반갑습니다", "t0": 300, "t1": 500, "is_special": false},
+        {"text": "<|endoftext|>", "t0": 500, "t1": 500, "is_special": true}
+      ]
+    }
+  ]
+}

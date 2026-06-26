@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / local tooling
+.claude/
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+GEMINI_API_KEY
+
+# Pipeline outputs (generated per video — do not commit)
+**/source.mkv
+**/audio.wav
+**/words.json
+**/transcript_raw.json
+**/*.mkv
+**/*.mp4
+**/*.srt
+**/*.wav
+
+# Legacy mux filenames from older ksub versions
+*_subtitled.mkv
+*_subtitled.mp4
+subtitled.mkv
+subtitled.mp4
+ko.srt
+zh.srt
+en.srt
+source.srt
