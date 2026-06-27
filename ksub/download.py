@@ -8,6 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ksub.fs import extract_audio, file_nonempty
+from ksub.paths import audio_wav_path, source_video_path
+
 
 def check_prerequisites() -> None:
     """Verify yt-dlp and ffmpeg are available."""
@@ -36,27 +39,6 @@ def fetch_title(url: str) -> str:
     return result.stdout.strip()
 
 
-def fetch_title_from_mkv(mkv_path: Path) -> str:
-    """Read title metadata from an MKV file via ffprobe."""
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-show_entries",
-            "format_tags=title",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(mkv_path),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        return result.stdout.strip()
-    return ""
-
-
 def sanitize_title(title: str, url: str | None = None) -> str:
     """Sanitize a video title for use as a directory / output basename."""
     cleaned = re.sub(r"[^\w\s\-가-힣一-鿿々〆〤]", "", title, flags=re.UNICODE)
@@ -71,44 +53,6 @@ def sanitize_title(title: str, url: str | None = None) -> str:
         else:
             cleaned = "video_unknown"
     return cleaned
-
-
-def resolve_title(url: str | None, workdir: Path, mkv_path: Path) -> str:
-    """Resolve video title from URL, MKV metadata, or workdir name."""
-    if url:
-        return fetch_title(url)
-    title = fetch_title_from_mkv(mkv_path)
-    if title:
-        return title
-    folder_name = workdir.name
-    if folder_name:
-        return folder_name
-    return "video_unknown"
-
-
-def _file_nonempty(path: Path) -> bool:
-    return path.is_file() and path.stat().st_size > 0
-
-
-def extract_audio(mkv_path: Path, wav_path: Path) -> None:
-    """Extract 16 kHz mono WAV from MKV."""
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-i",
-            str(mkv_path),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            str(wav_path),
-            "-y",
-        ],
-        check=True,
-        capture_output=True,
-    )
 
 
 def download_video(url: str, mkv_path: Path) -> None:
@@ -158,17 +102,17 @@ def run_download(
     check_prerequisites()
     workdir.mkdir(parents=True, exist_ok=True)
 
-    mkv_path = workdir / "source.mkv"
-    wav_path = workdir / "audio.wav"
+    mkv_path = source_video_path(workdir)
+    wav_path = audio_wav_path(workdir)
 
     if skip_download:
-        if not _file_nonempty(mkv_path):
+        if not file_nonempty(mkv_path):
             print(f"error: expected {mkv_path} (use --skip-download only when MKV exists)", file=sys.stderr)
             raise SystemExit(1)
         return
 
-    mkv_exists = _file_nonempty(mkv_path)
-    wav_exists = _file_nonempty(wav_path)
+    mkv_exists = file_nonempty(mkv_path)
+    wav_exists = file_nonempty(wav_path)
 
     if mkv_exists and wav_exists and not force:
         return

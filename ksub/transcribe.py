@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 
 from ksub import config
+from ksub.fs import extract_audio, file_nonempty
+from ksub.paths import audio_wav_path, resolve_video_input, words_json_path
+from ksub.types import Word, WordValidationError, normalize_words, validate_words
 
 
 def check_prerequisites() -> str:
@@ -24,7 +27,7 @@ def check_prerequisites() -> str:
         return "whisper_cpp"
 
     print(
-        "error: no ASR engine available — install mlx-whisper (pip install mlx-whisper) "
+        "error: no ASR engine available — install mlx-whisper (pip install ksub[mlx]) "
         "or whisper-cpp (brew install whisper-cpp)",
         file=sys.stderr,
     )
@@ -54,9 +57,9 @@ def resolve_whisper_cpp_model() -> Path:
     raise SystemExit(1)
 
 
-def adapt_mlx_segments(segments: list[dict]) -> list[dict]:
+def adapt_mlx_segments(segments: list[dict]) -> list[Word]:
     """Flatten mlx-whisper segments into normalized words.json entries."""
-    words: list[dict] = []
+    words: list[Word] = []
     for segment in segments:
         for entry in segment.get("words", []):
             word = entry.get("word", "")
@@ -77,9 +80,9 @@ def adapt_mlx_segments(segments: list[dict]) -> list[dict]:
     return words
 
 
-def adapt_whisper_cpp_json(data: dict) -> list[dict]:
+def adapt_whisper_cpp_json(data: dict) -> list[Word]:
     """Convert whisper.cpp --output-json-full to words.json."""
-    words: list[dict] = []
+    words: list[Word] = []
     for segment in data.get("transcription", []):
         entries = segment.get("words")
         if entries is None:
@@ -102,42 +105,7 @@ def adapt_whisper_cpp_json(data: dict) -> list[dict]:
     return words
 
 
-def validate_words(words: list[dict]) -> None:
-    """Validate words.json before segmentation."""
-    if len(words) < 1:
-        print("error: words.json has no entries", file=sys.stderr)
-        raise SystemExit(1)
-    for i, w in enumerate(words):
-        try:
-            float(w["start"])
-            float(w["end"])
-        except (KeyError, TypeError, ValueError):
-            print(f"error: words.json entry {i} has invalid start/end", file=sys.stderr)
-            raise SystemExit(1)
-
-
-def extract_audio(mkv_path: Path, wav_path: Path) -> None:
-    """Extract 16 kHz mono WAV from MKV (transcribe-stage convenience)."""
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-i",
-            str(mkv_path),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            str(wav_path),
-            "-y",
-        ],
-        check=True,
-        capture_output=True,
-    )
-
-
-def _transcribe_mlx(wav_path: Path) -> list[dict]:
+def _transcribe_mlx(wav_path: Path) -> list[Word]:
     import mlx_whisper
 
     print("Note: mlx-whisper may download ~3 GB model on first run (whisper-large-v3-mlx).")
@@ -150,7 +118,7 @@ def _transcribe_mlx(wav_path: Path) -> list[dict]:
     return adapt_mlx_segments(result["segments"])
 
 
-def _transcribe_whisper_cpp(wav_path: Path, workdir: Path) -> list[dict]:
+def _transcribe_whisper_cpp(wav_path: Path, workdir: Path) -> list[Word]:
     model_path = resolve_whisper_cpp_model()
     output_prefix = workdir / "transcript_raw"
     subprocess.run(
@@ -177,20 +145,14 @@ def _transcribe_whisper_cpp(wav_path: Path, workdir: Path) -> list[dict]:
     return adapt_whisper_cpp_json(data)
 
 
-def _file_nonempty(path: Path) -> bool:
-    return path.is_file() and path.stat().st_size > 0
-
-
 def run_transcribe(workdir: Path, *, force: bool = False) -> None:
     """Run the transcribe stage: audio.wav → words.json."""
-    words_path = workdir / "words.json"
-    wav_path = workdir / "audio.wav"
-    if _file_nonempty(words_path) and not force:
+    words_path = words_json_path(workdir)
+    wav_path = audio_wav_path(workdir)
+    if file_nonempty(words_path) and not force:
         return
 
-    if not _file_nonempty(wav_path):
-        from ksub.paths import resolve_video_input
-
+    if not file_nonempty(wav_path):
         video_path = resolve_video_input(workdir)
         if video_path is not None:
             extract_audio(video_path, wav_path)
@@ -204,6 +166,12 @@ def run_transcribe(workdir: Path, *, force: bool = False) -> None:
     else:
         words = _transcribe_whisper_cpp(wav_path, workdir)
 
-    validate_words(words)
+    try:
+        normalize_words(words)
+        validate_words(words)
+    except WordValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+
     with open(words_path, "w", encoding="utf-8") as f:
         json.dump(words, f, ensure_ascii=False, indent=2)

@@ -1,5 +1,9 @@
 """All tuneable constants for the ksub pipeline."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 # Translation engine
 TRANSLATION_ENGINE = "gemini"  # "gemini" | "ollama"
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -34,3 +38,73 @@ LONG_TOKEN_WARN_CHARS = 20
 # Translation batching
 BATCH_SIZE = 80
 TRANSLATION_CONTEXT_LINES = 5
+
+
+@dataclass(frozen=True)
+class Lang:
+    """Language profile for mux metadata, translation prompts, and re-wrap."""
+
+    cli: str
+    max_chars_per_line: int
+    reading_speed: float
+    ffmpeg_lang: str
+    ffmpeg_title: str
+    # Translation system prompt; empty for the source language (never translated).
+    system_prompt: str = ""
+
+
+_ZH_PROMPT = (
+    "Translate the Korean subtitle lines to Simplified Chinese (简体中文), "
+    "mainland standard usage. "
+    'Return ONLY a JSON array of objects: [{"id": N, "translation": "..."}, ...]. '
+    "Match the input IDs exactly. Natural conversational register suitable for subtitles. "
+    "Preserve line breaks (\\n) exactly. "
+    "No commentary, no markdown fences, no merging or splitting of lines."
+)
+_EN_PROMPT = (
+    "Translate the Korean subtitle lines to English. "
+    'Return ONLY a JSON array of objects: [{"id": N, "translation": "..."}, ...]. '
+    "Match the input IDs exactly. Natural conversational register suitable for subtitles. "
+    "Preserve line breaks (\\n) exactly. "
+    "No commentary, no markdown fences, no merging or splitting of lines."
+)
+
+# Insertion order is the mux track order (source first, then targets).
+LANGS: dict[str, Lang] = {
+    "ko": Lang(
+        cli="ko",
+        max_chars_per_line=MAX_CHARS_PER_LINE_CJK,
+        reading_speed=READING_SPEED_CJK,
+        ffmpeg_lang="kor",
+        ffmpeg_title="한국어",
+    ),
+    "zh": Lang(
+        cli="zh",
+        max_chars_per_line=MAX_CHARS_PER_LINE_CJK,
+        reading_speed=READING_SPEED_CJK,
+        ffmpeg_lang="zho",
+        ffmpeg_title="中文",
+        system_prompt=_ZH_PROMPT,
+    ),
+    "en": Lang(
+        cli="en",
+        max_chars_per_line=MAX_CHARS_PER_LINE,
+        reading_speed=READING_SPEED_LATIN,
+        ffmpeg_lang="eng",
+        ffmpeg_title="English",
+        system_prompt=_EN_PROMPT,
+    ),
+}
+
+# Source language is the first entry; every other entry is a translation target.
+SOURCE_LANG = next(iter(LANGS))
+TRANSLATION_LANGS = tuple(cli for cli in LANGS if cli != SOURCE_LANG)
+MUX_TRACK_ORDER = tuple(LANGS)
+
+
+def get_lang(cli: str) -> Lang:
+    """Look up a language profile by CLI code (ko, zh, en)."""
+    try:
+        return LANGS[cli]
+    except KeyError:
+        raise ValueError(f"unsupported language: {cli}") from None

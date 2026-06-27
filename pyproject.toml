@@ -9,13 +9,14 @@ description = "YouTube → multilingual subtitled video pipeline (Korean source)
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "google-genai>=1.0",
-    "mlx-whisper>=0.4",
     "srt>=3.5",
 ]
 
 [project.optional-dependencies]
+gemini = ["google-genai>=1.0"]
+mlx = ["mlx-whisper>=0.4"]
 dev = ["pytest>=8.0"]
+all = ["google-genai>=1.0", "mlx-whisper>=0.4"]
 
 [project.scripts]
 ksub = "ksub.cli:main"

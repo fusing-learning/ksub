@@ -7,53 +7,50 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import srt
 
 from ksub import config
-from ksub.paths import remove_legacy_playback_files, resolve_srt_path, srt_path
+from ksub.fs import file_nonempty
+from ksub.paths import remove_legacy_srt, resolve_srt_path, srt_path
 from ksub.segment import (
     extend_cue_for_reading_speed,
     len_raw,
     wrap_text_lines,
 )
+from ksub.types import CueInput, TranslationResult
 
-SYSTEM_PROMPTS = {
-    "zh-CN": (
-        "Translate the Korean subtitle lines to Simplified Chinese (简体中文), "
-        "mainland standard usage. "
-        'Return ONLY a JSON array of objects: [{"id": N, "translation": "..."}, ...]. '
-        "Match the input IDs exactly. Natural conversational register suitable for subtitles. "
-        "Preserve line breaks (\\n) exactly. "
-        "No commentary, no markdown fences, no merging or splitting of lines."
-    ),
-    "en": (
-        "Translate the Korean subtitle lines to English. "
-        'Return ONLY a JSON array of objects: [{"id": N, "translation": "..."}, ...]. '
-        "Match the input IDs exactly. Natural conversational register suitable for subtitles. "
-        "Preserve line breaks (\\n) exactly. "
-        "No commentary, no markdown fences, no merging or splitting of lines."
-    ),
-}
-
-_client = None
-_token_usage = {"input": 0, "output": 0}
-_cost_line: str | None = None
+MAX_RETRIES = 2
 
 
-def _get_client():
-    """Build the Gemini client on first use."""
-    global _client
-    if _client is None:
-        import os
-        from google import genai
+@dataclass
+class TokenUsage:
+    input: int = 0
+    output: int = 0
 
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise SystemExit("GEMINI_API_KEY is not set — required for translation (see §1).")
-        _client = genai.Client(api_key=api_key)
-    return _client
+
+@dataclass
+class TranslationSession:
+    """Per-run translation state (client, token usage, cost summary)."""
+
+    engine: str
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
+    cost_line: str | None = None
+    prerequisites_checked: bool = False
+    _gemini_client: object | None = field(default=None, repr=False)
+
+    def gemini_client(self):
+        if self._gemini_client is None:
+            import os
+            from google import genai
+
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                raise SystemExit("GEMINI_API_KEY is not set — required for translation.")
+            self._gemini_client = genai.Client(api_key=api_key)
+        return self._gemini_client
 
 
 def check_gemini_prerequisites() -> None:
@@ -61,7 +58,10 @@ def check_gemini_prerequisites() -> None:
     try:
         import google.genai  # noqa: F401
     except ImportError:
-        print("error: google-genai not installed — pip install google-genai", file=sys.stderr)
+        print(
+            "error: google-genai not installed — pip install ksub[gemini]",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
 
 
@@ -82,6 +82,17 @@ def check_ollama_prerequisites() -> None:
         raise SystemExit(1)
 
 
+def _build_user_content(batch: list[CueInput], context: str) -> str:
+    user_content = ""
+    if context:
+        user_content += (
+            "Previous context (do NOT translate — for register reference only):\n"
+            f"{context}\n\n"
+        )
+    user_content += f"Translate these cues:\n{json.dumps(batch, ensure_ascii=False)}"
+    return user_content
+
+
 def _read_srt(path: Path) -> list[srt.Subtitle]:
     with open(path, encoding="utf-8-sig") as f:
         return list(srt.parse(f.read()))
@@ -92,7 +103,7 @@ def _write_srt(path: Path, cues: list[srt.Subtitle]) -> None:
         f.write(srt.compose(cues))
 
 
-def _ids_match(batch: list[dict], result: list[dict]) -> bool:
+def _ids_match(batch: list[CueInput], result: list[TranslationResult]) -> bool:
     input_ids = {item["id"] for item in batch}
     try:
         output_ids = {item["id"] for item in result}
@@ -101,14 +112,22 @@ def _ids_match(batch: list[dict], result: list[dict]) -> bool:
     return input_ids == output_ids
 
 
-def _call_gemini(batch: list[dict], target_lang: str, context: str = "") -> list[dict]:
-    system_prompt = SYSTEM_PROMPTS[target_lang]
-    user_content = ""
-    if context:
-        user_content += f"Previous context (do NOT translate — for register reference only):\n{context}\n\n"
-    user_content += f"Translate these cues:\n{json.dumps(batch, ensure_ascii=False)}"
+def _is_rate_limited(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in (429, 503):
+        return True
+    err_str = str(exc).lower()
+    return "429" in err_str or "503" in err_str
 
-    resp = _get_client().models.generate_content(
+
+def _call_gemini(
+    session: TranslationSession,
+    batch: list[CueInput],
+    system_prompt: str,
+    context: str = "",
+) -> list[TranslationResult]:
+    user_content = _build_user_content(batch, context)
+
+    resp = session.gemini_client().models.generate_content(
         model=config.GEMINI_MODEL,
         contents=[{"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_content}]}],
         config={"response_mime_type": "application/json"},
@@ -116,22 +135,23 @@ def _call_gemini(batch: list[dict], target_lang: str, context: str = "") -> list
 
     usage = resp.usage_metadata
     if usage is not None:
-        _token_usage["input"] += usage.prompt_token_count or 0
-        _token_usage["output"] += usage.candidates_token_count or 0
+        session.token_usage.input += usage.prompt_token_count or 0
+        session.token_usage.output += usage.candidates_token_count or 0
 
     return json.loads(resp.text)
 
 
-def _call_ollama(batch: list[dict], target_lang: str, context: str = "") -> list[dict]:
-    user_content = ""
-    if context:
-        user_content += f"Previous context (do NOT translate — for register reference only):\n{context}\n\n"
-    user_content += f"Translate these cues:\n{json.dumps(batch, ensure_ascii=False)}"
+def _call_ollama(
+    batch: list[CueInput],
+    system_prompt: str,
+    context: str = "",
+) -> list[TranslationResult]:
+    user_content = _build_user_content(batch, context)
 
     payload = json.dumps({
         "model": config.OLLAMA_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPTS[target_lang]},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
         "format": "json",
@@ -151,87 +171,105 @@ def _call_ollama(batch: list[dict], target_lang: str, context: str = "") -> list
     return json.loads(content)
 
 
+def _check_engine_prerequisites(session: TranslationSession) -> None:
+    if session.prerequisites_checked:
+        return
+    if session.engine == "gemini":
+        check_gemini_prerequisites()
+    elif session.engine == "ollama":
+        check_ollama_prerequisites()
+    else:
+        print(f"error: unknown translation engine: {session.engine}", file=sys.stderr)
+        raise SystemExit(1)
+    session.prerequisites_checked = True
+
+
 def _call_engine(
-    batch: list[dict],
-    target_lang: str,
+    session: TranslationSession,
+    batch: list[CueInput],
+    system_prompt: str,
     context: str,
-    engine: str,
-) -> list[dict]:
-    if engine == "ollama":
-        return _call_ollama(batch, target_lang, context)
-    return _call_gemini(batch, target_lang, context)
+) -> list[TranslationResult]:
+    if session.engine == "ollama":
+        return _call_ollama(batch, system_prompt, context)
+    return _call_gemini(session, batch, system_prompt, context)
 
 
 def _translate_batch_with_retry(
-    batch: list[dict],
-    target_lang: str,
+    session: TranslationSession,
+    batch: list[CueInput],
+    system_prompt: str,
     context: str,
-    engine: str,
     batch_num: int,
-) -> list[dict]:
+) -> list[TranslationResult]:
     last_error: Exception | None = None
-    last_result: list[dict] | None = None
+    last_result: list[TranslationResult] | None = None
+    last_json_error: json.JSONDecodeError | None = None
 
-    for attempt in range(2):
+    for attempt in range(MAX_RETRIES):
         try:
-            last_result = _call_engine(batch, target_lang, context, engine)
+            last_result = _call_engine(session, batch, system_prompt, context)
             if _ids_match(batch, last_result):
                 return last_result
             print(
-                f"Translation batch {batch_num}: ID mismatch, retrying ({attempt + 1}/1)",
+                f"Translation batch {batch_num}: ID mismatch, "
+                f"retrying ({attempt + 1}/{MAX_RETRIES})",
                 file=sys.stderr,
             )
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            last_json_error = exc
             print(
-                f"Translation batch {batch_num}: JSON parse error, retrying ({attempt + 1}/1)",
+                f"Translation batch {batch_num}: JSON parse error, "
+                f"retrying ({attempt + 1}/{MAX_RETRIES})",
                 file=sys.stderr,
             )
             last_error = None
         except Exception as exc:
-            err_str = str(exc).lower()
-            if "429" in err_str or "503" in err_str:
-                if attempt == 0:
-                    time.sleep(5)
-                    continue
+            if _is_rate_limited(exc) and attempt < MAX_RETRIES - 1:
+                time.sleep(5)
+                continue
             last_error = exc
             raise
+
+    if last_json_error is not None and last_result is None:
+        print(
+            f"error: translation JSON parse failed after {MAX_RETRIES} attempts",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     input_ids = sorted(item["id"] for item in batch)
     try:
         output_ids = sorted(item["id"] for item in last_result) if last_result else []
     except Exception:
         output_ids = []
-    print(f"error: translation ID mismatch — input IDs: {input_ids}, returned: {output_ids}", file=sys.stderr)
+    print(
+        f"error: translation ID mismatch — input IDs: {input_ids}, returned: {output_ids}",
+        file=sys.stderr,
+    )
     if last_error:
         raise last_error
     raise SystemExit(1)
 
 
 def translate_cues(
-    cues: list[dict],
-    target_lang: str,
-    *,
-    engine: str | None = None,
-) -> list[dict]:
+    cues: list[CueInput],
+    system_prompt: str,
+    session: TranslationSession,
+) -> list[TranslationResult]:
     """Translate cue dicts; returns [{"id": N, "translation": "..."}, ...]."""
-    effective_engine = engine or config.TRANSLATION_ENGINE
+    _check_engine_prerequisites(session)
 
-    if effective_engine == "gemini":
-        check_gemini_prerequisites()
-    elif effective_engine == "ollama":
-        check_ollama_prerequisites()
-    else:
-        print(f"error: unknown translation engine: {effective_engine}", file=sys.stderr)
-        raise SystemExit(1)
-
-    all_results: list[dict] = []
+    all_results: list[TranslationResult] = []
     context_lines: list[str] = []
 
     for batch_start in range(0, len(cues), config.BATCH_SIZE):
         batch = cues[batch_start : batch_start + config.BATCH_SIZE]
         batch_num = batch_start // config.BATCH_SIZE + 1
         context = "\n".join(context_lines[-config.TRANSLATION_CONTEXT_LINES :])
-        result = _translate_batch_with_retry(batch, target_lang, context, effective_engine, batch_num)
+        result = _translate_batch_with_retry(
+            session, batch, system_prompt, context, batch_num
+        )
         all_results.extend(result)
         for item in result:
             context_lines.append(item["translation"])
@@ -241,52 +279,61 @@ def translate_cues(
 
 def _rewrap_translation(
     text: str,
-    target_lang: str,
+    lang: config.Lang,
     start: float,
     end: float,
     next_start: float | None,
 ) -> tuple[str, float, bool]:
-    if target_lang == "zh-CN":
-        max_per_line = config.MAX_CHARS_PER_LINE_CJK
-        reading_speed = config.READING_SPEED_CJK
-    else:
-        max_per_line = config.MAX_CHARS_PER_LINE
-        reading_speed = config.READING_SPEED_LATIN
-
     lines = text.split("\n")
-    if len(lines) <= 2 and all(len_raw(line) <= max_per_line for line in lines):
+    if len(lines) <= 2 and all(len_raw(line) <= lang.max_chars_per_line for line in lines):
         wrapped = text
     else:
         flat = text.replace("\n", " ")
-        wrapped = wrap_text_lines(flat, max_per_line)
+        wrapped = wrap_text_lines(flat, lang.max_chars_per_line)
         if wrapped.count("\n") > 1:
             wrapped = "\n".join(wrapped.split("\n")[:2])
 
     new_end, exceeds = extend_cue_for_reading_speed(
-        wrapped, start, end, next_start, reading_speed
+        wrapped, start, end, next_start, lang.reading_speed
     )
     return wrapped, new_end, exceeds
 
 
+def _finalize_cost_line(session: TranslationSession) -> None:
+    if session.engine == "ollama":
+        session.cost_line = (
+            f"Translation: local (Ollama/{config.OLLAMA_MODEL}), no API cost"
+        )
+    elif session.token_usage.input or session.token_usage.output:
+        cost = (
+            session.token_usage.input * config.GEMINI_RATE_INPUT / 1_000_000
+            + session.token_usage.output * config.GEMINI_RATE_OUTPUT / 1_000_000
+        )
+        session.cost_line = (
+            f"Translation: {session.token_usage.input:,} input tokens, "
+            f"{session.token_usage.output:,} output tokens → est. ${cost:.2f} "
+            f"(rates in config; actual billing may differ)"
+        )
+    else:
+        session.cost_line = "Translation: token usage unavailable"
+
+
 def translate_srt(
     ko_srt_path: str,
-    target_lang: str,
+    lang: config.Lang,
     out_path: str,
-    *,
-    engine: str | None = None,
+    session: TranslationSession,
 ) -> None:
     """Parse ko.srt, translate, re-wrap, and write output SRT."""
-    global _cost_line
-
     ko_path = Path(ko_srt_path)
     out = Path(out_path)
     subtitles = _read_srt(ko_path)
 
-    cue_dicts = [{"id": sub.index, "text": sub.content} for sub in subtitles]
-    translations = translate_cues(cue_dicts, target_lang, engine=engine)
+    cue_dicts: list[CueInput] = [
+        {"id": sub.index, "text": sub.content} for sub in subtitles
+    ]
+    translations = translate_cues(cue_dicts, lang.system_prompt, session)
     trans_map = {item["id"]: item["translation"] for item in translations}
-
-    effective_engine = engine or config.TRANSLATION_ENGINE
 
     speed_warnings: list[int] = []
     for i, sub in enumerate(subtitles):
@@ -302,7 +349,7 @@ def translate_srt(
         next_start = subtitles[i + 1].start.total_seconds() if i + 1 < len(subtitles) else None
 
         wrapped, new_end, exceeds = _rewrap_translation(
-            translation, target_lang, start_sec, end_sec, next_start
+            translation, lang, start_sec, end_sec, next_start
         )
         sub.content = wrapped
         if new_end > end_sec:
@@ -321,46 +368,6 @@ def translate_srt(
 
     _write_srt(out, subtitles)
 
-    if effective_engine == "ollama":
-        _cost_line = f"Translation: local (Ollama/{config.OLLAMA_MODEL}), no API cost"
-    elif _token_usage["input"] or _token_usage["output"]:
-        cost = (
-            _token_usage["input"] * config.GEMINI_RATE_INPUT / 1_000_000
-            + _token_usage["output"] * config.GEMINI_RATE_OUTPUT / 1_000_000
-        )
-        _cost_line = (
-            f"Translation: {_token_usage['input']:,} input tokens, "
-            f"{_token_usage['output']:,} output tokens → est. ${cost:.2f} "
-            f"(rates in config; actual billing may differ)"
-        )
-    else:
-        _cost_line = "Translation: token usage unavailable"
-
-
-def get_cost_line() -> str | None:
-    """Return the translation cost summary line, if translation ran."""
-    return _cost_line
-
-
-def reset_cost_tracking() -> None:
-    """Reset token usage and cost line between runs."""
-    global _cost_line
-    _token_usage["input"] = 0
-    _token_usage["output"] = 0
-    _cost_line = None
-
-
-def _lang_output_path(workdir: Path, cli_lang: str) -> Path:
-    return srt_path(workdir, cli_lang)
-
-
-def _cli_to_internal(cli_lang: str) -> str:
-    return "zh-CN" if cli_lang == "zh" else "en"
-
-
-def _file_nonempty(path: Path) -> bool:
-    return path.is_file() and path.stat().st_size > 0
-
 
 def run_translate(
     workdir: Path,
@@ -368,30 +375,28 @@ def run_translate(
     *,
     force: bool = False,
     engine: str | None = None,
-) -> None:
-    """Run translation for each requested CLI lang code."""
-    reset_cost_tracking()
+) -> str | None:
+    """Run translation for each requested CLI lang code. Returns cost summary if any ran."""
+    effective_engine = engine or config.TRANSLATION_ENGINE
+    session = TranslationSession(engine=effective_engine)
     ko_path = resolve_srt_path(workdir, "ko")
 
-    if not _file_nonempty(ko_path):
+    if not file_nonempty(ko_path):
         print(f"error: expected {ko_path}", file=sys.stderr)
         raise SystemExit(1)
 
     ran_any = False
     for cli_lang in langs:
-        out_path = _lang_output_path(workdir, cli_lang)
-        if _file_nonempty(out_path) and not force:
+        out_path = srt_path(workdir, cli_lang)
+        if file_nonempty(out_path) and not force:
             continue
 
-        target_lang = _cli_to_internal(cli_lang)
-        translate_srt(str(ko_path), target_lang, str(out_path), engine=engine)
-        legacy = workdir / ("zh.srt" if cli_lang == "zh" else "en.srt")
-        if legacy.is_file() and legacy != out_path:
-            legacy.unlink()
+        lang = config.get_lang(cli_lang)
+        translate_srt(str(ko_path), lang, str(out_path), session)
+        remove_legacy_srt(workdir, cli_lang)
         ran_any = True
 
     if ran_any:
-        remove_legacy_playback_files(workdir)
-
-    if not ran_any:
-        reset_cost_tracking()
+        _finalize_cost_line(session)
+        return session.cost_line
+    return None

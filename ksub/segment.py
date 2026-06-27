@@ -11,7 +11,9 @@ from pathlib import Path
 import srt
 
 from ksub import config
-from ksub.paths import resolve_srt_path, srt_path
+from ksub.fs import file_nonempty
+from ksub.paths import remove_legacy_srt, resolve_srt_path, srt_path, words_json_path
+from ksub.types import Word, WordValidationError, normalize_words, validate_words
 
 SENTENCE_END = {".", "?", "!", "。", "？", "！"}
 
@@ -50,13 +52,13 @@ def _is_cjk_wide(ch: str) -> bool:
 
 @dataclass
 class RawCue:
-    words: list[dict]
+    words: list[Word]
     text: str
     start: float
     end: float
 
 
-def _join_words(words: list[dict]) -> str:
+def _join_words(words: list[Word]) -> str:
     return " ".join(w["word"] for w in words)
 
 
@@ -66,7 +68,7 @@ def _ends_sentence(word: str) -> bool:
 
 
 def segment_words(
-    words: list[dict],
+    words: list[Word],
     *,
     max_chars_per_line: int = config.MAX_CHARS_PER_LINE_CJK,
     max_chars_per_cue: int | None = None,
@@ -77,7 +79,7 @@ def segment_words(
         max_chars_per_cue = max_chars_per_line * 2
 
     cues: list[RawCue] = []
-    current: list[dict] = []
+    current: list[Word] = []
 
     for i, word_entry in enumerate(words):
         if current:
@@ -112,7 +114,7 @@ def segment_words(
     return _timing_fix(wrapped, reading_speed, max_chars_per_line)
 
 
-def _make_raw_cue(words: list[dict]) -> RawCue:
+def _make_raw_cue(words: list[Word]) -> RawCue:
     text = _join_words(words)
     return RawCue(
         words=list(words),
@@ -370,28 +372,27 @@ def extend_cue_for_reading_speed(
     return end, True
 
 
-def _file_nonempty(path: Path) -> bool:
-    return path.is_file() and path.stat().st_size > 0
-
-
 def run_segment(workdir: Path, *, force: bool = False) -> None:
     """Run the segment stage: words.json → ko.srt."""
-    words_path = workdir / "words.json"
+    words_path = words_json_path(workdir)
     ko_path = resolve_srt_path(workdir, "ko")
 
-    if _file_nonempty(ko_path) and not force:
+    if file_nonempty(ko_path) and not force:
         return
 
-    if not _file_nonempty(words_path):
+    if not file_nonempty(words_path):
         print(f"error: expected {words_path}", file=sys.stderr)
         raise SystemExit(1)
 
     with open(words_path, encoding="utf-8") as f:
-        words = json.load(f)
+        words: list[Word] = json.load(f)
 
-    if len(words) < 1:
-        print("error: words.json has no entries", file=sys.stderr)
-        raise SystemExit(1)
+    try:
+        normalize_words(words)
+        validate_words(words)
+    except WordValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
     cues = segment_words(words)
     subtitles = raw_cues_to_srt(cues)
@@ -399,5 +400,4 @@ def run_segment(workdir: Path, *, force: bool = False) -> None:
     out_path = srt_path(workdir, "ko")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(srt.compose(subtitles))
-    if out_path != ko_path and ko_path.is_file():
-        ko_path.unlink()
+    remove_legacy_srt(workdir, "ko")

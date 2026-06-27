@@ -6,12 +6,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ksub.download import fetch_title_from_mkv, sanitize_title
+from ksub import config
+from ksub.fs import file_nonempty
 from ksub.paths import (
     SOURCE_VIDEO,
-    remove_legacy_playback_files,
+    remove_legacy_srt,
+    remove_legacy_video,
     resolve_srt_path,
     resolve_video_input,
+    source_video_path,
     video_output_path,
 )
 
@@ -24,22 +27,17 @@ def check_prerequisites() -> None:
         raise SystemExit(1)
 
 
-def resolve_mux_title(workdir: Path, url: str | None) -> str:
-    """Resolve title for mux output basename."""
-    mkv_path = workdir / "source.mkv"
-    if url:
-        from ksub.download import fetch_title
-
-        raw = fetch_title(url)
-    else:
-        raw = fetch_title_from_mkv(mkv_path)
-        if not raw:
-            raw = workdir.name or "video_unknown"
-    return sanitize_title(raw, url)
+def _remux_temp_path(output_path: Path) -> Path:
+    """Temporary sibling used when remuxing an existing final output in place."""
+    return output_path.with_name(f".{output_path.stem}.remux.tmp{output_path.suffix}")
 
 
-def _file_nonempty(path: Path) -> bool:
-    return path.is_file() and path.stat().st_size > 0
+def _subprocess_stderr(exc: subprocess.CalledProcessError) -> str:
+    if exc.stderr is None:
+        return ""
+    if isinstance(exc.stderr, bytes):
+        return exc.stderr.decode(errors="replace").strip()
+    return str(exc.stderr).strip()
 
 
 def run_mux(
@@ -48,7 +46,6 @@ def run_mux(
     *,
     force: bool = False,
     mp4: bool = False,
-    url: str | None = None,
     keep_source: bool = False,
 ) -> Path | None:
     """Mux video with subtitle tracks; output <basename>.mkv beside matching .srt files."""
@@ -60,33 +57,41 @@ def run_mux(
     if video_path is None:
         print(f"error: expected {SOURCE_VIDEO} or muxed video in {workdir}", file=sys.stderr)
         raise SystemExit(1)
-    if not _file_nonempty(ko_path):
+    if not file_nonempty(ko_path):
         print(f"error: expected {ko_path}", file=sys.stderr)
         raise SystemExit(1)
 
-    for lang in langs:
-        if lang not in ("zh", "en"):
-            print(f"error: unsupported mux language: {lang}", file=sys.stderr)
+    for cli_lang in langs:
+        try:
+            config.get_lang(cli_lang)
+        except ValueError:
+            print(f"error: unsupported mux language: {cli_lang}", file=sys.stderr)
             raise SystemExit(1)
-        lang_srt = resolve_srt_path(workdir, lang)
-        if not _file_nonempty(lang_srt):
-            print(f"error: expected {lang_srt} for --langs {lang}", file=sys.stderr)
+        lang_srt = resolve_srt_path(workdir, cli_lang)
+        if not file_nonempty(lang_srt):
+            print(f"error: expected {lang_srt} for --langs {cli_lang}", file=sys.stderr)
             raise SystemExit(1)
 
     output_path = video_output_path(workdir, mp4=mp4)
 
-    if _file_nonempty(output_path) and not force:
+    if file_nonempty(output_path) and not force:
         return None
 
-    cmd = ["ffmpeg", "-i", str(video_path), "-i", str(ko_path)]
+    actual_output_path = output_path
+    replacing_existing_output = video_path == output_path
+    if replacing_existing_output:
+        actual_output_path = _remux_temp_path(output_path)
+        if actual_output_path.exists():
+            actual_output_path.unlink()
 
-    track_langs: list[str] = ["ko"]
-    if "zh" in langs:
-        cmd.extend(["-i", str(resolve_srt_path(workdir, "zh"))])
-        track_langs.append("zh")
-    if "en" in langs:
-        cmd.extend(["-i", str(resolve_srt_path(workdir, "en"))])
-        track_langs.append("en")
+    track_langs = ["ko"]
+    for cli_lang in config.MUX_TRACK_ORDER[1:]:
+        if cli_lang in langs:
+            track_langs.append(cli_lang)
+
+    cmd = ["ffmpeg", "-i", str(video_path), "-i", str(ko_path)]
+    for cli_lang in track_langs[1:]:
+        cmd.extend(["-i", str(resolve_srt_path(workdir, cli_lang))])
 
     cmd.extend(["-map", "0:v", "-map", "0:a"])
     for idx in range(len(track_langs)):
@@ -98,32 +103,45 @@ def run_mux(
     else:
         cmd.extend(["-c:s", "srt"])
 
-    metadata = [
-        ("kor", "한국어"),
-        ("zho", "中文"),
-        ("eng", "English"),
-    ]
-    meta_idx = 0
-    for track in track_langs:
-        if track == "ko":
-            lang_code, title_text = metadata[0]
-        elif track == "zh":
-            lang_code, title_text = metadata[1]
-        else:
-            lang_code, title_text = metadata[2]
+    for meta_idx, cli_lang in enumerate(track_langs):
+        lang = config.get_lang(cli_lang)
         cmd.extend([
             f"-metadata:s:s:{meta_idx}",
-            f"language={lang_code}",
+            f"language={lang.ffmpeg_lang}",
             f"-metadata:s:s:{meta_idx}",
-            f"title={title_text}",
+            f"title={lang.ffmpeg_title}",
         ])
-        meta_idx += 1
 
-    cmd.extend([str(output_path), "-y"])
+    cmd.extend([str(actual_output_path), "-y"])
 
-    subprocess.run(cmd, check=True, capture_output=True)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = _subprocess_stderr(exc)
+        if stderr:
+            print(stderr, file=sys.stderr)
+        else:
+            print(f"error: ffmpeg failed with exit code {exc.returncode}", file=sys.stderr)
+        if replacing_existing_output and actual_output_path.exists():
+            actual_output_path.unlink()
+        raise
+    except Exception:
+        if replacing_existing_output and actual_output_path.exists():
+            actual_output_path.unlink()
+        raise
 
-    source_path = workdir / SOURCE_VIDEO
+    if replacing_existing_output:
+        try:
+            actual_output_path.replace(output_path)
+        except OSError as exc:
+            print(
+                f"error: failed to replace {output_path} with remuxed output: {exc}",
+                file=sys.stderr,
+            )
+            print(f"remuxed output kept at: {actual_output_path}", file=sys.stderr)
+            raise
+
+    source_path = source_video_path(workdir)
     if (
         not keep_source
         and source_path.is_file()
@@ -132,5 +150,7 @@ def run_mux(
     ):
         source_path.unlink()
 
-    remove_legacy_playback_files(workdir)
+    remove_legacy_video(workdir, mp4=mp4)
+    for cli_lang in config.MUX_TRACK_ORDER:
+        remove_legacy_srt(workdir, cli_lang)
     return output_path

@@ -5,9 +5,42 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ksub.transcribe import adapt_mlx_segments, adapt_whisper_cpp_json, validate_words
+import pytest
+
+from ksub.transcribe import adapt_mlx_segments, adapt_whisper_cpp_json
+from ksub.types import WordValidationError, normalize_words, validate_words
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_normalize_words_coerces_string_timestamps():
+    words = [{"word": "안녕", "start": "0.5", "end": "1.5"}]
+    normalize_words(words)
+    validate_words(words)
+    assert words[0]["start"] == 0.5
+    assert words[0]["end"] == 1.5
+    assert isinstance(words[0]["start"], float)
+    assert isinstance(words[0]["end"], float)
+
+
+def test_validate_words_rejects_missing_word_text():
+    with pytest.raises(WordValidationError):
+        validate_words([{"start": 0.0, "end": 1.0}])
+
+
+def test_validate_words_rejects_empty_word_text():
+    with pytest.raises(WordValidationError):
+        validate_words([{"word": "  ", "start": 0.0, "end": 1.0}])
+
+
+def test_validate_words_rejects_non_numeric_timestamp():
+    with pytest.raises(WordValidationError):
+        normalize_words([{"word": "안녕", "start": "abc", "end": 1.0}])
+
+
+def test_validate_words_rejects_non_positive_duration():
+    with pytest.raises(WordValidationError):
+        validate_words([{"word": "안녕", "start": 1.0, "end": 1.0}])
 
 
 def test_whisper_cpp_adapter():

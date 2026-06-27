@@ -19,11 +19,11 @@ YouTube URL  (or local source.mkv)
       ↓
 ② Transcribe    → words.json
       ↓
-③ Segment       → ko.srt
+③ Segment       → <basename>.ko.srt
       ↓
-④ Translate     → zh.srt (and/or en.srt)
+④ Translate     → <basename>.zh.srt (and/or <basename>.en.srt)
       ↓
-⑤ Mux           → subtitled.mkv (inside workdir; source.mkv removed after mux)
+⑤ Mux           → <basename>.mkv (inside workdir; source.mkv removed after mux)
 ```
 
 ### Stage 1: Download
@@ -46,16 +46,16 @@ YouTube URL  (or local source.mkv)
 - Converts word timestamps into broadcast-style Korean subtitles
 - Splits on line length (max 2 lines × 21 chars), sentence ends, pauses, and max duration (7 s)
 - Adjusts timing for reading speed and min gaps between cues
-- Writes `ko.srt`
+- Writes `<basename>.ko.srt`
 
 **No API key needed.**
 
 ### Stage 4: Translate
 
-- Reads `ko.srt`, sends Korean text to Gemini (default) or Ollama in batches
+- Reads `<basename>.ko.srt` (or legacy `ko.srt`), sends Korean text to Gemini (default) or Ollama in batches
 - Preserves cue count, timestamps, and line breaks exactly
 - Re-wraps translated text to line-length limits
-- Writes `zh.srt` and/or `en.srt`
+- Writes `<basename>.zh.srt` and/or `<basename>.en.srt`
 
 **Requires `GEMINI_API_KEY`** (or a running Ollama instance).
 
@@ -64,7 +64,7 @@ YouTube URL  (or local source.mkv)
 - Combines `source.mkv` + subtitle files into one file
 - **No video re-encode** — copy only, finishes in seconds
 - Track order is always: Korean → Chinese → English
-- Output: `<workdir>/subtitled.mkv` (everything in one folder)
+- Output: `<workdir>/<basename>.mkv` (everything in one folder)
 - Deletes `source.mkv` after mux to avoid two full-video copies (use `--keep-source` to retain it)
 
 ---
@@ -90,13 +90,19 @@ export WHISPER_CPP_MODEL=~/.cache/whisper/ggml-large-v3.bin
 ## Install
 
 ```bash
-pip install -e .
+pip install -e ".[gemini,mlx]"
+```
+
+Gemini translation only:
+
+```bash
+pip install -e ".[gemini]"
 ```
 
 For development (includes pytest):
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,gemini,mlx]"
 ```
 
 After install, `ksub` is available as a terminal command.
@@ -191,7 +197,7 @@ ksub --mux-only      --workdir ~/Videos/my_show --out ~/Videos
 
 ### Already have a Korean SRT?
 
-Put `source.mkv` and your `ko.srt` in the workdir, then:
+Put `source.mkv` and your `<basename>.ko.srt` in the workdir (legacy `ko.srt` is also accepted), then:
 
 ```bash
 ksub --translate-only --workdir ~/Videos/my_show
@@ -226,9 +232,9 @@ VLC matches external subs when the basename matches: `Episode.mkv` + `Episode.zh
 |------|------|----------|
 | `--download-only` | Download video + extract audio | YouTube URL |
 | `--transcribe-only` | ASR → `words.json` | `audio.wav` (or `source.mkv` to extract from) |
-| `--segment-only` | `words.json` → `ko.srt` | `words.json` |
-| `--translate-only` | `ko.srt` → `zh.srt` / `en.srt` | `ko.srt` |
-| `--mux-only` | Combine video + SRTs | `source.mkv`, `ko.srt`, `--workdir` |
+| `--segment-only` | `words.json` → `<basename>.ko.srt` | `words.json` |
+| `--translate-only` | `<basename>.ko.srt` → `<basename>.zh.srt` / `<basename>.en.srt` | `<basename>.ko.srt` or legacy `ko.srt` |
+| `--mux-only` | Combine video + SRTs | `source.mkv` or `<basename>.mkv`, basename-matched SRTs, `--workdir` |
 | `--no-mux` | Full pipeline minus mux | YouTube URL (or `--skip-download`) |
 
 Other useful flags:
@@ -240,7 +246,7 @@ Other useful flags:
 | `--workdir <dir>` | Use an explicit work directory instead of auto-naming |
 | `--out <dir>` | Output directory (default: current directory) |
 | `--langs zh\|en\|en,zh\|""` | Target languages (`""` = skip translation) |
-| `--mp4` | Output `subtitled.mp4` instead of `subtitled.mkv` |
+| `--mp4` | Output `<basename>.mp4` instead of `<basename>.mkv` |
 | `--keep-source` | Keep `source.mkv` after mux (default: delete to save space) |
 | `--engine-translate gemini\|ollama` | Override translation engine |
 
@@ -251,7 +257,7 @@ Stages are **idempotent** — if output already exists, the stage is skipped unl
 ## Edit workflow
 
 1. Run the full pipeline once.
-2. Open `ko.srt` or `zh.srt` in any text editor and fix lines.
+2. Open `<basename>.ko.srt` or `<basename>.zh.srt` in any text editor and fix lines.
 3. Re-mux to bake changes into the video:
 
 ```bash
@@ -276,7 +282,7 @@ Warnings on stderr are **not errors** — the pipeline still completes.
 |---------|---------|
 | `cue(s) exceed reading speed` | Fast dialogue with no gap before the next cue; display time can't be extended further. Spot-check those lines in VLC. |
 | `translated cue(s) exceed reading speed` | Chinese text is longer than Korean and hits the same gap limit. |
-| `long token (N chars): ...` | Whisper merged words without a space. Safe to fix manually in `ko.srt`. |
+| `long token (N chars): ...` | Whisper merged words without a space. Safe to fix manually in `<basename>.ko.srt`. |
 
 Variety shows and rapid banter trigger more of these. Hand-edit the flagged cues if any feel too fast on screen.
 
@@ -299,5 +305,5 @@ VLC for Android and MX Player handle MKV with embedded SRT tracks and show a sub
 | Add English instead of Chinese | `ksub "<URL>" --langs en` |
 | Korean only, no API key | `ksub "<URL>" --langs ""` or `--segment-only` |
 | Re-mux after editing SRTs | `ksub --mux-only --workdir <dir>` |
-| Translate an existing `ko.srt` | `ksub --translate-only --workdir <dir>` |
+| Translate an existing Korean SRT | Put `<basename>.ko.srt` or legacy `ko.srt` in the workdir, then `ksub --translate-only --workdir <dir>` |
 | Re-run one stage | Add `--force` to that stage's flag |

@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-from ksub import download, mux, segment, transcribe, translate
-from ksub.paths import resolve_srt_path, srt_path, video_output_path
+from ksub import config, download, mux, segment, transcribe, translate
+from ksub.paths import resolve_srt_path, video_output_path
+
+
+@dataclass
+class RunContext:
+    args: argparse.Namespace
+    workdir: Path
+    langs: list[str]
+    force: bool
+    engine: str | None
+
+
+@dataclass
+class RunResult:
+    muxed_path: Path | None = None
+    cost_line: str | None = None
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -58,6 +75,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _parse_langs(langs_arg: str) -> list[str]:
+    langs = [x.strip() for x in langs_arg.split(",") if x.strip()]
+    for lang in langs:
+        if lang not in config.TRANSLATION_LANGS:
+            print(f"error: unsupported language: {lang}", file=sys.stderr)
+            raise SystemExit(1)
+    return langs
+
+
 def _resolve_workdir(args: argparse.Namespace, out_dir: Path) -> Path:
     if args.workdir:
         return Path(args.workdir).resolve()
@@ -81,37 +107,51 @@ def _validate_url_requirement(args: argparse.Namespace, needs_download: bool) ->
         raise SystemExit(1)
 
 
+def _resolve_context_workdir(args: argparse.Namespace, out_dir: Path) -> Path:
+    is_isolated = _isolated_stage(args) is not None
+
+    if args.mux_only and not args.workdir:
+        print("error: --mux-only requires --workdir", file=sys.stderr)
+        raise SystemExit(1)
+
+    if is_isolated and args.workdir:
+        return Path(args.workdir).resolve()
+
+    _validate_url_requirement(args, needs_download=not args.skip_download)
+    return _resolve_workdir(args, out_dir)
+
+
+def _isolated_stage(args: argparse.Namespace) -> str | None:
+    # Stage flags are the keys of ISOLATED_STAGES (single source of truth).
+    for flag in ISOLATED_STAGES:
+        if getattr(args, flag):
+            return flag
+    return None
+
+
 def _print_summary(
     workdir: Path,
-    langs: list[str],
     *,
     muxed_path: Path | None = None,
-    translation_ran: bool = False,
+    cost_line: str | None = None,
 ) -> None:
     print("Outputs:")
     print(f"  workdir:  {workdir}")
 
     ko_path = resolve_srt_path(workdir, "ko")
     if ko_path.is_file():
-        print(f"  ko.srt:   {ko_path.resolve()}")
+        print(f"  {ko_path.name}:   {ko_path.resolve()}")
 
-    zh_path = resolve_srt_path(workdir, "zh")
-    if "zh" in langs or zh_path.is_file():
-        if zh_path.is_file():
-            print(f"  zh.srt:   {zh_path.resolve()}")
-
-    en_path = resolve_srt_path(workdir, "en")
-    if "en" in langs or en_path.is_file():
-        if en_path.is_file():
-            print(f"  en.srt:   {en_path.resolve()}")
+    for cli_lang in config.TRANSLATION_LANGS:
+        path = resolve_srt_path(workdir, cli_lang)
+        if path.is_file():
+            print(f"  {path.name}:   {path.resolve()}")
 
     if muxed_path and muxed_path.is_file():
         print(f"  video:    {muxed_path.resolve()}")
 
-    if translation_ran:
-        cost_line = translate.get_cost_line()
-        if cost_line:
-            print(cost_line)
+    if cost_line:
+        print(cost_line)
 
     print(
         "\nSamsung's stock player and Google Photos ignore muxed soft subs — "
@@ -119,110 +159,115 @@ def _print_summary(
     )
 
 
+def _run_download(ctx: RunContext) -> RunResult:
+    _validate_url_requirement(ctx.args, needs_download=True)
+    download.run_download(
+        ctx.workdir,
+        ctx.args.url,
+        force=ctx.force,
+        skip_download=ctx.args.skip_download,
+    )
+    return RunResult()
+
+
+def _run_transcribe(ctx: RunContext) -> RunResult:
+    transcribe.run_transcribe(ctx.workdir, force=ctx.force)
+    return RunResult()
+
+
+def _run_segment(ctx: RunContext) -> RunResult:
+    segment.run_segment(ctx.workdir, force=ctx.force)
+    return RunResult()
+
+
+def _run_translate(ctx: RunContext) -> RunResult:
+    if not ctx.langs:
+        return RunResult()
+    cost_line = translate.run_translate(
+        ctx.workdir,
+        ctx.langs,
+        force=ctx.force,
+        engine=ctx.engine,
+    )
+    return RunResult(cost_line=cost_line)
+
+
+def _resolve_muxed_path(ctx: RunContext) -> Path:
+    muxed_path = mux.run_mux(
+        ctx.workdir,
+        ctx.langs,
+        force=ctx.force,
+        mp4=ctx.args.mp4,
+        keep_source=ctx.args.keep_source,
+    )
+    if muxed_path is None:
+        return video_output_path(ctx.workdir, mp4=ctx.args.mp4)
+    return muxed_path
+
+
+def _run_mux(ctx: RunContext) -> RunResult:
+    return RunResult(muxed_path=_resolve_muxed_path(ctx))
+
+
+def _run_full_pipeline(ctx: RunContext) -> RunResult:
+    download.run_download(
+        ctx.workdir,
+        ctx.args.url,
+        force=ctx.force,
+        skip_download=ctx.args.skip_download,
+    )
+    transcribe.run_transcribe(ctx.workdir, force=ctx.force)
+    segment.run_segment(ctx.workdir, force=ctx.force)
+
+    cost_line = None
+    if ctx.langs:
+        cost_line = translate.run_translate(
+            ctx.workdir,
+            ctx.langs,
+            force=ctx.force,
+            engine=ctx.engine,
+        )
+
+    muxed_path = _resolve_muxed_path(ctx) if not ctx.args.no_mux else None
+
+    return RunResult(muxed_path=muxed_path, cost_line=cost_line)
+
+
+ISOLATED_STAGES: dict[str, Callable[[RunContext], RunResult]] = {
+    "download_only": _run_download,
+    "transcribe_only": _run_transcribe,
+    "segment_only": _run_segment,
+    "translate_only": _run_translate,
+    "mux_only": _run_mux,
+}
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     out_dir = Path(args.out).resolve()
     print(f"Output directory: {out_dir}")
 
-    requested_langs = [x.strip() for x in args.langs.split(",") if x.strip()]
-    for lang in requested_langs:
-        if lang not in ("zh", "en"):
-            print(f"error: unsupported language: {lang}", file=sys.stderr)
-            raise SystemExit(1)
+    requested_langs = _parse_langs(args.langs)
+    workdir = _resolve_context_workdir(args, out_dir)
 
-    is_isolated = any([
-        args.download_only,
-        args.transcribe_only,
-        args.segment_only,
-        args.translate_only,
-        args.mux_only,
-    ])
-
-    if args.mux_only and not args.workdir:
-        print("error: --mux-only requires --workdir", file=sys.stderr)
-        raise SystemExit(1)
-
-    if is_isolated and args.mux_only:
-        workdir = Path(args.workdir).resolve()
-    elif is_isolated and args.workdir:
-        workdir = Path(args.workdir).resolve()
-    else:
-        _validate_url_requirement(args, needs_download=not args.skip_download)
-        workdir = _resolve_workdir(args, out_dir)
-
-    force = args.force
-    engine = args.engine_translate
-    translation_ran = False
-    muxed_path: Path | None = None
-
-    if args.download_only:
-        _validate_url_requirement(args, needs_download=True)
-        download.run_download(workdir, args.url, force=force, skip_download=args.skip_download)
-        _print_summary(workdir, requested_langs)
-        return
-
-    if args.transcribe_only:
-        transcribe.run_transcribe(workdir, force=force)
-        _print_summary(workdir, requested_langs)
-        return
-
-    if args.segment_only:
-        segment.run_segment(workdir, force=force)
-        _print_summary(workdir, requested_langs)
-        return
-
-    if args.translate_only:
-        if requested_langs:
-            translate.run_translate(workdir, requested_langs, force=force, engine=engine)
-            translation_ran = True
-        _print_summary(workdir, requested_langs, translation_ran=translation_ran)
-        return
-
-    if args.mux_only:
-        muxed_path = mux.run_mux(
-            workdir,
-            requested_langs,
-            force=force,
-            mp4=args.mp4,
-            url=args.url,
-            keep_source=args.keep_source,
-        )
-        if muxed_path is None:
-            muxed_path = video_output_path(workdir, mp4=args.mp4)
-        _print_summary(workdir, requested_langs, muxed_path=muxed_path)
-        return
-
-    # Full pipeline or --no-mux
-    download.run_download(
-        workdir,
-        args.url,
-        force=force,
-        skip_download=args.skip_download,
+    ctx = RunContext(
+        args=args,
+        workdir=workdir,
+        langs=requested_langs,
+        force=args.force,
+        engine=args.engine_translate,
     )
-    transcribe.run_transcribe(workdir, force=force)
-    segment.run_segment(workdir, force=force)
 
-    if requested_langs:
-        translate.run_translate(workdir, requested_langs, force=force, engine=engine)
-        translation_ran = True
-
-    if not args.no_mux:
-        muxed_path = mux.run_mux(
-            workdir,
-            requested_langs,
-            force=force,
-            mp4=args.mp4,
-            url=args.url,
-            keep_source=args.keep_source,
-        )
-        if muxed_path is None:
-            muxed_path = video_output_path(workdir, mp4=args.mp4)
+    stage = _isolated_stage(args)
+    if stage is not None:
+        result = ISOLATED_STAGES[stage](ctx)
+    else:
+        result = _run_full_pipeline(ctx)
 
     _print_summary(
         workdir,
-        requested_langs,
-        muxed_path=muxed_path if not args.no_mux else None,
-        translation_ran=translation_ran,
+        muxed_path=result.muxed_path,
+        cost_line=result.cost_line,
     )
 
 
