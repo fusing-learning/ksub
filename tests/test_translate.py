@@ -14,10 +14,121 @@ from ksub import config
 from ksub.translate import (
     MAX_RETRIES,
     TranslationSession,
+    _call_engine_with_api_retry,
     _ids_match,
+    _is_transient_api_error,
+    _loads_translation_json,
+    _parse_gemini_json,
     translate_cues,
     translate_srt,
 )
+
+
+def test_is_transient_api_error_detects_gemini_server_error():
+    try:
+        from google.genai import errors
+    except ImportError:
+        pytest.skip("google-genai not installed")
+
+    exc = errors.ServerError(
+        503,
+        {"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}},
+    )
+    assert _is_transient_api_error(exc)
+
+
+def test_call_engine_with_api_retry_recovers_from_transient_error():
+    try:
+        from google.genai import errors
+    except ImportError:
+        pytest.skip("google-genai not installed")
+
+    batch = [{"id": 1, "text": "안녕"}]
+    session = TranslationSession(engine="gemini")
+    calls = []
+
+    def fake_call(sess, batch, system_prompt, context):
+        calls.append(1)
+        if len(calls) == 1:
+            raise errors.ServerError(
+                503,
+                {
+                    "error": {
+                        "code": 503,
+                        "message": "high demand",
+                        "status": "UNAVAILABLE",
+                    }
+                },
+            )
+        return [{"id": 1, "translation": "你好"}]
+
+    with patch("ksub.translate._call_engine", side_effect=fake_call):
+        with patch("ksub.translate.time.sleep"):
+            result = _call_engine_with_api_retry(
+                session, batch, "prompt", "", batch_num=1
+            )
+
+    assert result == [{"id": 1, "translation": "你好"}]
+    assert len(calls) == 2
+
+
+def test_loads_translation_json_strips_markdown_fence():
+    payload = '```json\n[{"id": 1, "translation": "你好"}]\n```'
+    assert _loads_translation_json(payload) == [{"id": 1, "translation": "你好"}]
+
+
+def test_parse_gemini_json_uses_parsed_field():
+    resp = type("Resp", (), {"parsed": [{"id": 1, "translation": "你好"}], "text": None})()
+    assert _parse_gemini_json(resp) == [{"id": 1, "translation": "你好"}]
+
+
+def test_parse_gemini_json_falls_back_to_text():
+    payload = '[{"id": 1, "translation": "你好"}]'
+    resp = type("Resp", (), {"parsed": None, "text": payload})()
+    assert _parse_gemini_json(resp) == [{"id": 1, "translation": "你好"}]
+
+
+def test_parse_gemini_json_raises_when_text_missing():
+    resp = type(
+        "Resp",
+        (),
+        {
+            "parsed": None,
+            "text": None,
+            "candidates": [],
+            "prompt_feedback": None,
+        },
+    )()
+    with pytest.raises(json.JSONDecodeError, match="no text"):
+        _parse_gemini_json(resp)
+
+
+def test_call_gemini_disables_thinking():
+    session = TranslationSession(engine="gemini")
+    captured: dict = {}
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            captured.update(kwargs)
+            return type(
+                "Resp",
+                (),
+                {
+                    "parsed": [{"id": 1, "translation": "你好"}],
+                    "text": None,
+                    "usage_metadata": None,
+                },
+            )()
+
+    session._gemini_client = type("Client", (), {"models": FakeModels()})()
+
+    from ksub.translate import _call_gemini
+
+    result = _call_gemini(session, [{"id": 1, "text": "안녕"}], "prompt")
+    assert result == [{"id": 1, "translation": "你好"}]
+    assert captured["config"]["thinking_config"] == {
+        "thinking_budget": config.GEMINI_THINKING_BUDGET,
+    }
 
 
 def test_ids_match():

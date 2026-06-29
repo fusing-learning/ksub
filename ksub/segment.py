@@ -13,7 +13,13 @@ import srt
 from ksub import config
 from ksub.fs import file_nonempty
 from ksub.paths import remove_legacy_srt, resolve_srt_path, srt_path, words_json_path
-from ksub.types import Word, WordValidationError, normalize_words, validate_words
+from ksub.types import (
+    Word,
+    WordValidationError,
+    clean_whisper_hallucinations,
+    normalize_words,
+    validate_words,
+)
 
 SENTENCE_END = {".", "?", "!", "。", "？", "！"}
 
@@ -389,6 +395,8 @@ def run_segment(workdir: Path, *, force: bool = False) -> None:
 
     try:
         normalize_words(words)
+        for warning in clean_whisper_hallucinations(words):
+            print(f"warning: {warning}", file=sys.stderr)
         validate_words(words)
     except WordValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)

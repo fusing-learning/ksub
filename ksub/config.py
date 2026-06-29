@@ -7,6 +7,8 @@ from dataclasses import dataclass
 # Translation engine
 TRANSLATION_ENGINE = "gemini"  # "gemini" | "ollama"
 GEMINI_MODEL = "gemini-2.5-flash"
+# 0 = thinking off (reliable JSON output). -1 = automatic (may return empty text).
+GEMINI_THINKING_BUDGET = 0
 GEMINI_RATE_INPUT = 0.30  # USD/1M input tokens (estimate only)
 GEMINI_RATE_OUTPUT = 2.50  # USD/1M output tokens (estimate only)
 
@@ -35,9 +37,19 @@ MIN_CUE_DURATION_BEFORE_SENTENCE_BREAK = 1.0
 PAUSE_GAP_SECONDS = 0.5
 LONG_TOKEN_WARN_CHARS = 20
 
+# Whisper repetitive hallucinations (e.g. stuck "likelikelike..." on applause/noise)
+REPETITIVE_HALLUCINATION_MIN_CHARS = 40
+REPETITIVE_HALLUCINATION_MIN_REPEATS = 8
+REPETITIVE_HALLUCINATION_GAP_WARN_SECONDS = 3.0
+
 # Translation batching
 BATCH_SIZE = 80
 TRANSLATION_CONTEXT_LINES = 5
+
+# Gemini transient errors (503 high demand, 429 rate limit)
+TRANSLATION_API_MAX_RETRIES = 6
+TRANSLATION_API_RETRY_BASE_SECONDS = 5
+TRANSLATION_API_RETRY_MAX_SECONDS = 60
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,13 @@ from pathlib import Path
 from ksub import config
 from ksub.fs import extract_audio, file_nonempty
 from ksub.paths import audio_wav_path, resolve_video_input, words_json_path
-from ksub.types import Word, WordValidationError, normalize_words, validate_words
+from ksub.types import (
+    Word,
+    WordValidationError,
+    clean_whisper_hallucinations,
+    normalize_words,
+    validate_words,
+)
 
 
 def check_prerequisites() -> str:
@@ -106,7 +112,13 @@ def adapt_whisper_cpp_json(data: dict) -> list[Word]:
 
 
 def _transcribe_mlx(wav_path: Path) -> list[Word]:
+    import mlx.core as mx
     import mlx_whisper
+
+    # Cap MLX's buffer reuse pool so freed memory is returned to the OS instead
+    # of hoarded. Without this, RAM climbs into the high teens of GB on long
+    # audio (large-v3 + word_timestamps) and stays pinned there for the run.
+    mx.set_cache_limit(4 * 1024**3)
 
     print("Note: mlx-whisper may download ~3 GB model on first run (whisper-large-v3-mlx).")
     result = mlx_whisper.transcribe(
@@ -168,6 +180,8 @@ def run_transcribe(workdir: Path, *, force: bool = False) -> None:
 
     try:
         normalize_words(words)
+        for warning in clean_whisper_hallucinations(words):
+            print(f"warning: {warning}", file=sys.stderr)
         validate_words(words)
     except WordValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)

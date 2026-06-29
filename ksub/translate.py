@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -20,7 +21,7 @@ from ksub.segment import (
     len_raw,
     wrap_text_lines,
 )
-from ksub.types import CueInput, TranslationResult
+from ksub.types import CueInput, TranslationResult, sanitize_cue_text
 
 MAX_RETRIES = 2
 
@@ -112,11 +113,134 @@ def _ids_match(batch: list[CueInput], result: list[TranslationResult]) -> bool:
     return input_ids == output_ids
 
 
-def _is_rate_limited(exc: Exception) -> bool:
-    if isinstance(exc, urllib.error.HTTPError) and exc.code in (429, 503):
+def _is_transient_api_error(exc: Exception) -> bool:
+    """Whether an API failure is likely temporary and worth retrying."""
+    try:
+        from google.genai import errors
+
+        if isinstance(exc, errors.APIError) and exc.code in (429, 500, 502, 503):
+            return True
+    except ImportError:
+        pass
+
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in (429, 500, 502, 503):
         return True
+
     err_str = str(exc).lower()
-    return "429" in err_str or "503" in err_str
+    return any(
+        marker in err_str
+        for marker in ("429", "500", "502", "503", "unavailable", "rate limit")
+    )
+
+
+def _api_retry_sleep(attempt: int) -> float:
+    delay = config.TRANSLATION_API_RETRY_BASE_SECONDS * (2**attempt)
+    return min(delay, config.TRANSLATION_API_RETRY_MAX_SECONDS)
+
+
+def _call_engine_with_api_retry(
+    session: TranslationSession,
+    batch: list[CueInput],
+    system_prompt: str,
+    context: str,
+    batch_num: int,
+) -> list[TranslationResult]:
+    """Call the translation engine, retrying transient Gemini/Ollama outages."""
+    last_error: Exception | None = None
+
+    for attempt in range(config.TRANSLATION_API_MAX_RETRIES):
+        try:
+            return _call_engine(session, batch, system_prompt, context)
+        except Exception as exc:
+            last_error = exc
+            if (
+                _is_transient_api_error(exc)
+                and attempt < config.TRANSLATION_API_MAX_RETRIES - 1
+            ):
+                delay = _api_retry_sleep(attempt)
+                code = getattr(exc, "code", None)
+                label = f"API {code}" if code is not None else "API error"
+                print(
+                    f"Translation batch {batch_num}: {label} transient failure, "
+                    f"retrying in {delay:.0f}s "
+                    f"({attempt + 1}/{config.TRANSLATION_API_MAX_RETRIES})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("translation API retry loop exited without result")
+
+
+def _gemini_response_diagnostics(resp: object) -> str:
+    """Summarize why a Gemini response may lack parseable text."""
+    parts: list[str] = []
+
+    feedback = getattr(resp, "prompt_feedback", None)
+    if feedback is not None:
+        block_reason = getattr(feedback, "block_reason", None)
+        if block_reason is not None:
+            parts.append(f"prompt blocked ({block_reason})")
+        safety = getattr(feedback, "safety_ratings", None) or []
+        flagged = [
+            f"{rating.category}={rating.probability}"
+            for rating in safety
+            if getattr(rating, "blocked", False)
+        ]
+        if flagged:
+            parts.append("prompt safety: " + ", ".join(flagged))
+
+    candidates = getattr(resp, "candidates", None) or []
+    if not candidates:
+        parts.append("no candidates returned")
+    else:
+        candidate = candidates[0]
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason is not None:
+            parts.append(f"finish_reason={finish_reason}")
+        finish_message = getattr(candidate, "finish_message", None)
+        if finish_message:
+            parts.append(str(finish_message))
+
+    return "; ".join(parts) if parts else "empty response text"
+
+
+def _loads_translation_json(text: str) -> list[TranslationResult]:
+    """Parse a JSON array from model output, tolerating minor formatting issues."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start != -1 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
+
+
+def _parse_gemini_json(resp: object) -> list[TranslationResult]:
+    """Parse JSON translation output from a Gemini response."""
+    parsed = getattr(resp, "parsed", None)
+    if isinstance(parsed, list):
+        return parsed
+
+    text = getattr(resp, "text", None)
+    if not text:
+        detail = _gemini_response_diagnostics(resp)
+        raise json.JSONDecodeError(
+            f"Gemini returned no text ({detail})",
+            detail,
+            0,
+        )
+
+    return _loads_translation_json(text)
 
 
 def _call_gemini(
@@ -130,7 +254,10 @@ def _call_gemini(
     resp = session.gemini_client().models.generate_content(
         model=config.GEMINI_MODEL,
         contents=[{"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_content}]}],
-        config={"response_mime_type": "application/json"},
+        config={
+            "response_mime_type": "application/json",
+            "thinking_config": {"thinking_budget": config.GEMINI_THINKING_BUDGET},
+        },
     )
 
     usage = resp.usage_metadata
@@ -138,7 +265,7 @@ def _call_gemini(
         session.token_usage.input += usage.prompt_token_count or 0
         session.token_usage.output += usage.candidates_token_count or 0
 
-    return json.loads(resp.text)
+    return _parse_gemini_json(resp)
 
 
 def _call_ollama(
@@ -208,7 +335,9 @@ def _translate_batch_with_retry(
 
     for attempt in range(MAX_RETRIES):
         try:
-            last_result = _call_engine(session, batch, system_prompt, context)
+            last_result = _call_engine_with_api_retry(
+                session, batch, system_prompt, context, batch_num
+            )
             if _ids_match(batch, last_result):
                 return last_result
             print(
@@ -225,13 +354,29 @@ def _translate_batch_with_retry(
             )
             last_error = None
         except Exception as exc:
-            if _is_rate_limited(exc) and attempt < MAX_RETRIES - 1:
-                time.sleep(5)
-                continue
             last_error = exc
             raise
 
     if last_json_error is not None and last_result is None:
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            print(
+                f"Translation batch {batch_num}: JSON parse failed, "
+                f"splitting into {len(batch[:mid])}+{len(batch[mid:])} cues",
+                file=sys.stderr,
+            )
+            left = _translate_batch_with_retry(
+                session, batch[:mid], system_prompt, context, batch_num
+            )
+            right_context = context
+            if left:
+                extra = "\n".join(item["translation"] for item in left)
+                right_context = f"{context}\n{extra}".strip() if context else extra
+            right = _translate_batch_with_retry(
+                session, batch[mid:], system_prompt, right_context, batch_num
+            )
+            return left + right
+
         print(
             f"error: translation JSON parse failed after {MAX_RETRIES} attempts",
             file=sys.stderr,
@@ -329,9 +474,16 @@ def translate_srt(
     out = Path(out_path)
     subtitles = _read_srt(ko_path)
 
-    cue_dicts: list[CueInput] = [
-        {"id": sub.index, "text": sub.content} for sub in subtitles
-    ]
+    cue_dicts: list[CueInput] = []
+    for sub in subtitles:
+        text, was_hallucination = sanitize_cue_text(sub.content)
+        if was_hallucination:
+            print(
+                f"warning: cue {sub.index} collapsed repetitive hallucination "
+                f"({len(sub.content)} chars) to {text!r} for translation",
+                file=sys.stderr,
+            )
+        cue_dicts.append({"id": sub.index, "text": text})
     translations = translate_cues(cue_dicts, lang.system_prompt, session)
     trans_map = {item["id"]: item["translation"] for item in translations}
 
