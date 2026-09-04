@@ -29,7 +29,16 @@ def check_prerequisites() -> None:
 def fetch_title(url: str) -> str:
     """Fetch video title via yt-dlp."""
     result = subprocess.run(
-        ["yt-dlp", "--print", "title", url],
+        [
+            "yt-dlp",
+            "--cookies-from-browser",
+            "chrome",
+            "--remote-components",
+            "ejs:github",
+            "--print",
+            "title",
+            url,
+        ],
         capture_output=True,
         text=True,
     )
@@ -59,6 +68,10 @@ def download_video(url: str, mkv_path: Path) -> None:
     """Download video with two-format fallback."""
     primary = [
         "yt-dlp",
+        "--cookies-from-browser",
+        "chrome",
+        "--remote-components",
+        "ejs:github",
         "-f",
         "bestvideo+bestaudio/best",
         "--merge-output-format",
@@ -73,6 +86,10 @@ def download_video(url: str, mkv_path: Path) -> None:
 
     fallback = [
         "yt-dlp",
+        "--cookies-from-browser",
+        "chrome",
+        "--remote-components",
+        "ejs:github",
         "-f",
         "best",
         "--merge-output-format",
