@@ -256,14 +256,17 @@ def _call_gemini(
         contents=[{"role": "user", "parts": [{"text": system_prompt + "\n\n" + user_content}]}],
         config={
             "response_mime_type": "application/json",
-            "thinking_config": {"thinking_budget": config.GEMINI_THINKING_BUDGET},
+            "thinking_config": {"thinking_level": config.GEMINI_THINKING_LEVEL},
         },
     )
 
     usage = resp.usage_metadata
     if usage is not None:
         session.token_usage.input += usage.prompt_token_count or 0
-        session.token_usage.output += usage.candidates_token_count or 0
+        # Thinking tokens are billed at the output rate.
+        session.token_usage.output += (usage.candidates_token_count or 0) + (
+            getattr(usage, "thoughts_token_count", None) or 0
+        )
 
     return _parse_gemini_json(resp)
 

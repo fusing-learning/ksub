@@ -103,7 +103,7 @@ def test_parse_gemini_json_raises_when_text_missing():
         _parse_gemini_json(resp)
 
 
-def test_call_gemini_disables_thinking():
+def test_call_gemini_uses_minimal_thinking():
     session = TranslationSession(engine="gemini")
     captured: dict = {}
 
@@ -127,7 +127,7 @@ def test_call_gemini_disables_thinking():
     result = _call_gemini(session, [{"id": 1, "text": "안녕"}], "prompt")
     assert result == [{"id": 1, "translation": "你好"}]
     assert captured["config"]["thinking_config"] == {
-        "thinking_budget": config.GEMINI_THINKING_BUDGET,
+        "thinking_level": config.GEMINI_THINKING_LEVEL,
     }
 
 

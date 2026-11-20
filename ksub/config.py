@@ -6,9 +6,10 @@ from dataclasses import dataclass
 
 # Translation engine
 TRANSLATION_ENGINE = "gemini"  # "gemini" | "ollama"
-GEMINI_MODEL = "gemini-2.5-flash"
-# 0 = thinking off (reliable JSON output). -1 = automatic (may return empty text).
-GEMINI_THINKING_BUDGET = 0
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+# Gemini 3.x uses thinking levels, not budgets. "minimal" keeps JSON output
+# reliable and thinking-token cost (billed as output) near zero.
+GEMINI_THINKING_LEVEL = "minimal"
 GEMINI_RATE_INPUT = 0.30  # USD/1M input tokens (estimate only)
 GEMINI_RATE_OUTPUT = 2.50  # USD/1M output tokens (estimate only)
 
