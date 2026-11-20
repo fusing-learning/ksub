@@ -19,6 +19,7 @@ class RunContext:
     langs: list[str]
     force: bool
     engine: str | None
+    vad: bool
 
 
 @dataclass
@@ -58,6 +59,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--engine-translate",
         choices=["gemini", "ollama"],
         help="Translation engine (overrides config)",
+    )
+    parser.add_argument(
+        "--no-vad",
+        action="store_true",
+        help="Skip Silero VAD; transcribe the full audio including non-speech",
     )
 
     args = parser.parse_args(argv)
@@ -171,7 +177,7 @@ def _run_download(ctx: RunContext) -> RunResult:
 
 
 def _run_transcribe(ctx: RunContext) -> RunResult:
-    transcribe.run_transcribe(ctx.workdir, force=ctx.force)
+    transcribe.run_transcribe(ctx.workdir, force=ctx.force, vad=ctx.vad)
     return RunResult()
 
 
@@ -216,7 +222,7 @@ def _run_full_pipeline(ctx: RunContext) -> RunResult:
         force=ctx.force,
         skip_download=ctx.args.skip_download,
     )
-    transcribe.run_transcribe(ctx.workdir, force=ctx.force)
+    transcribe.run_transcribe(ctx.workdir, force=ctx.force, vad=ctx.vad)
     segment.run_segment(ctx.workdir, force=ctx.force)
 
     cost_line = None
@@ -256,6 +262,7 @@ def main(argv: list[str] | None = None) -> None:
         langs=requested_langs,
         force=args.force,
         engine=args.engine_translate,
+        vad=not args.no_vad,
     )
 
     stage = _isolated_stage(args)

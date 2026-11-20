@@ -36,6 +36,7 @@ YouTube URL  (or local source.mkv)
 
 ### Stage 2: Transcribe
 
+- Runs **Silero VAD** first so applause, BGM, and silence never reach the decoder (pass `--no-vad` to skip)
 - Runs Korean speech recognition with **word-level timestamps**
 - Writes `words.json` (flat list of `{word, start, end}`)
 - Uses **mlx-whisper** on Apple Silicon (downloads ~3 GB model on first run)
@@ -92,6 +93,8 @@ export WHISPER_CPP_MODEL=~/.cache/whisper/ggml-large-v3.bin
 ```bash
 pip install -e ".[gemini,mlx]"
 ```
+
+`[mlx]` also pulls `numpy` and `onnxruntime` for Silero VAD. With whisper.cpp, add `[vad]` to get them; without them ksub warns and transcribes the full audio. Pass `--no-vad` to skip VAD entirely.
 
 Gemini translation only:
 
@@ -249,6 +252,7 @@ Other useful flags:
 | `--mp4` | Output `<basename>.mp4` instead of `<basename>.mkv` |
 | `--keep-source` | Keep `source.mkv` after mux (default: delete to save space) |
 | `--engine-translate gemini\|ollama` | Override translation engine |
+| `--no-vad` | Skip Silero VAD; transcribe the full audio including non-speech |
 
 Stages are **idempotent** — if output already exists, the stage is skipped unless `--force` is passed.
 

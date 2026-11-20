@@ -20,6 +20,21 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 # whisper.cpp fallback model
 WHISPER_CPP_MODEL = "~/.cache/whisper/ggml-large-v3.bin"
 
+# Silero VAD (run before Whisper so applause/BGM/silence never hit the decoder)
+# Pinned to a release tag and verified by SHA-256 so an upstream model change
+# can't silently break the ONNX input/output names this code relies on.
+VAD_MODEL_URL = (
+    "https://github.com/snakers4/silero-vad/raw/v6.2.3/src/silero_vad/data/silero_vad.onnx"
+)
+VAD_MODEL_SHA256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+VAD_MODEL_CACHE = "~/.cache/ksub/silero_vad.onnx"
+VAD_THRESHOLD = 0.5
+VAD_NEG_THRESHOLD = 0.35
+VAD_MIN_SPEECH_MS = 250
+VAD_MIN_SILENCE_MS = 400
+VAD_PAD_MS = 300
+VAD_MERGE_GAP_MS = 200
+
 # Subtitle line limits
 MAX_CHARS_PER_LINE = 42  # Latin (en.srt)
 MAX_CHARS_PER_LINE_CJK = 21  # Korean/Chinese (ko.srt, zh.srt)

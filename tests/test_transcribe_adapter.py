@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from ksub import transcribe
 from ksub.transcribe import adapt_mlx_segments, adapt_whisper_cpp_json
 from ksub.types import WordValidationError, normalize_words, validate_words
+
+
+@pytest.fixture(autouse=True)
+def _vad_deps_present():
+    """Run-transcribe tests mock VAD itself; don't depend on onnxruntime being installed."""
+    with patch("ksub.transcribe.vad_deps_available", return_value=True):
+        yield
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -87,3 +96,88 @@ def test_adapters_produce_same_schema():
             assert isinstance(entry["start"], float)
             assert isinstance(entry["end"], float)
             assert entry["start"] < entry["end"]
+
+
+def test_run_transcribe_passes_vad_clips_to_mlx(tmp_path: Path):
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"\x00" * 64)
+
+    words = [{"word": "안녕", "start": 1.0, "end": 1.5}]
+    with patch("ksub.transcribe.collect_speech_spans", return_value=[(1.0, 2.0), (4.0, 5.0)]):
+        with patch("ksub.transcribe.check_prerequisites", return_value="mlx"):
+            with patch("ksub.transcribe._transcribe_mlx", return_value=words) as mlx:
+                transcribe.run_transcribe(tmp_path, force=True, vad=True)
+
+    mlx.assert_called_once_with(wav, clip_timestamps=[1.0, 2.0, 4.0, 5.0])
+    dumped = json.loads((tmp_path / "words.json").read_text(encoding="utf-8"))
+    assert dumped == words
+
+
+def test_run_transcribe_no_vad_skips_speech_spans(tmp_path: Path):
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"\x00" * 64)
+
+    words = [{"word": "안녕", "start": 0.0, "end": 0.5}]
+    with patch("ksub.transcribe.collect_speech_spans") as collect:
+        with patch("ksub.transcribe.check_prerequisites", return_value="mlx"):
+            with patch("ksub.transcribe._transcribe_mlx", return_value=words) as mlx:
+                transcribe.run_transcribe(tmp_path, force=True, vad=False)
+
+    collect.assert_not_called()
+    mlx.assert_called_once_with(wav, clip_timestamps=None)
+
+
+def test_run_transcribe_empty_vad_falls_back_to_full_audio(tmp_path: Path, capsys):
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"\x00" * 64)
+
+    words = [{"word": "안녕", "start": 0.0, "end": 0.5}]
+    with patch("ksub.transcribe.collect_speech_spans", return_value=[]):
+        with patch("ksub.transcribe.check_prerequisites", return_value="mlx"):
+            with patch("ksub.transcribe._transcribe_mlx", return_value=words) as mlx:
+                transcribe.run_transcribe(tmp_path, force=True, vad=True)
+
+    mlx.assert_called_once_with(wav, clip_timestamps=None)
+    assert "VAD found no speech" in capsys.readouterr().err
+
+
+def test_run_transcribe_passes_spans_to_whisper_cpp(tmp_path: Path):
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"\x00" * 64)
+
+    words = [{"word": "안녕", "start": 11.0, "end": 12.0}]
+    spans = [(10.0, 20.0), (40.0, 50.0)]
+    with patch("ksub.transcribe.collect_speech_spans", return_value=spans):
+        with patch("ksub.transcribe.check_prerequisites", return_value="whisper_cpp"):
+            with patch("ksub.transcribe._transcribe_whisper_cpp", return_value=words) as cpp:
+                transcribe.run_transcribe(tmp_path, force=True, vad=True)
+
+    cpp.assert_called_once_with(wav, tmp_path, speech_spans=spans)
+
+
+def test_run_transcribe_missing_vad_deps_falls_back(tmp_path: Path, capsys):
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"\x00" * 64)
+
+    words = [{"word": "안녕", "start": 0.0, "end": 0.5}]
+    with patch("ksub.transcribe.vad_deps_available", return_value=False):
+        with patch("ksub.transcribe.collect_speech_spans") as collect:
+            with patch("ksub.transcribe.check_prerequisites", return_value="whisper_cpp"):
+                with patch("ksub.transcribe._transcribe_whisper_cpp", return_value=words) as cpp:
+                    transcribe.run_transcribe(tmp_path, force=True, vad=True)
+
+    collect.assert_not_called()
+    cpp.assert_called_once_with(wav, tmp_path, speech_spans=None)
+    assert "VAD skipped" in capsys.readouterr().err
+
+
+def test_run_transcribe_checks_engine_before_vad(tmp_path: Path):
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"\x00" * 64)
+
+    with patch("ksub.transcribe.collect_speech_spans") as collect:
+        with patch("ksub.transcribe.check_prerequisites", side_effect=SystemExit(1)):
+            with pytest.raises(SystemExit):
+                transcribe.run_transcribe(tmp_path, force=True, vad=True)
+
+    collect.assert_not_called()

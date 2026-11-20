@@ -90,7 +90,7 @@ def test_skip_download_full_pipeline_uses_workdir_without_url(tmp_path: Path):
         force=False,
         skip_download=True,
     )
-    run_transcribe.assert_called_once_with(resolved_workdir, force=False)
+    run_transcribe.assert_called_once_with(resolved_workdir, force=False, vad=True)
     run_segment.assert_called_once_with(resolved_workdir, force=False)
     run_translate.assert_not_called()
     run_mux.assert_not_called()
@@ -142,7 +142,7 @@ def test_full_pipeline_resolves_url_title_and_runs_stages_in_order(tmp_path: Pat
         force=False,
         skip_download=False,
     )
-    run_transcribe.assert_called_once_with(resolved_workdir, force=False)
+    run_transcribe.assert_called_once_with(resolved_workdir, force=False, vad=True)
     run_segment.assert_called_once_with(resolved_workdir, force=False)
     run_translate.assert_called_once_with(
         resolved_workdir,
@@ -163,3 +163,19 @@ def test_full_pipeline_resolves_url_title_and_runs_stages_in_order(tmp_path: Pat
         muxed_path=muxed_path,
         cost_line="cost line",
     )
+
+
+def test_no_vad_passed_to_transcribe(tmp_path: Path):
+    workdir = tmp_path / "episode"
+    resolved_workdir = workdir.resolve()
+
+    with patch("ksub.cli.transcribe.run_transcribe") as run_transcribe:
+        with patch("ksub.cli._print_summary"):
+            cli.main([
+                "--transcribe-only",
+                "--workdir",
+                str(workdir),
+                "--no-vad",
+            ])
+
+    run_transcribe.assert_called_once_with(resolved_workdir, force=False, vad=False)

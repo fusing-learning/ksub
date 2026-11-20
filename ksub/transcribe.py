@@ -18,6 +18,13 @@ from ksub.types import (
     normalize_words,
     validate_words,
 )
+from ksub.vad import (
+    collect_speech_spans,
+    flatten_clip_timestamps,
+    remap_concat_words,
+    vad_deps_available,
+    write_speech_wav,
+)
 
 
 def check_prerequisites() -> str:
@@ -111,7 +118,11 @@ def adapt_whisper_cpp_json(data: dict) -> list[Word]:
     return words
 
 
-def _transcribe_mlx(wav_path: Path) -> list[Word]:
+def _transcribe_mlx(
+    wav_path: Path,
+    *,
+    clip_timestamps: list[float] | None = None,
+) -> list[Word]:
     import mlx.core as mx
     import mlx_whisper
 
@@ -121,43 +132,92 @@ def _transcribe_mlx(wav_path: Path) -> list[Word]:
     mx.set_cache_limit(4 * 1024**3)
 
     print("Note: mlx-whisper may download ~3 GB model on first run (whisper-large-v3-mlx).")
-    result = mlx_whisper.transcribe(
-        str(wav_path),
-        path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
-        language="ko",
-        word_timestamps=True,
-    )
+    kwargs: dict = {
+        "path_or_hf_repo": "mlx-community/whisper-large-v3-mlx",
+        "language": "ko",
+        "word_timestamps": True,
+    }
+    if clip_timestamps:
+        kwargs["clip_timestamps"] = clip_timestamps
+        # Clips are non-contiguous (gaps are applause/BGM); don't feed previous
+        # text across them or a loop in one window poisons the next.
+        kwargs["condition_on_previous_text"] = False
+    result = mlx_whisper.transcribe(str(wav_path), **kwargs)
     return adapt_mlx_segments(result["segments"])
 
 
-def _transcribe_whisper_cpp(wav_path: Path, workdir: Path) -> list[Word]:
+def _transcribe_whisper_cpp(
+    wav_path: Path,
+    workdir: Path,
+    *,
+    speech_spans: list[tuple[float, float]] | None = None,
+) -> list[Word]:
     model_path = resolve_whisper_cpp_model()
+    asr_wav = wav_path
+    speech_wav: Path | None = None
+    if speech_spans:
+        speech_wav = workdir / "audio_speech.wav"
+        write_speech_wav(wav_path, speech_wav, speech_spans)
+        asr_wav = speech_wav
+
     output_prefix = workdir / "transcript_raw"
-    subprocess.run(
-        [
-            "whisper-cli",
-            "-m",
-            str(model_path),
-            "-l",
-            "ko",
-            "-f",
-            str(wav_path),
-            "--output-json-full",
-            "-ml",
-            "1",
-            "-of",
-            str(output_prefix),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    json_path = Path(f"{output_prefix}.json")
-    with open(json_path, encoding="utf-8") as f:
-        data = json.load(f)
-    return adapt_whisper_cpp_json(data)
+    try:
+        subprocess.run(
+            [
+                "whisper-cli",
+                "-m",
+                str(model_path),
+                "-l",
+                "ko",
+                "-f",
+                str(asr_wav),
+                "--output-json-full",
+                "-ml",
+                "1",
+                "-of",
+                str(output_prefix),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        json_path = Path(f"{output_prefix}.json")
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        words = adapt_whisper_cpp_json(data)
+        if speech_spans:
+            words = remap_concat_words(words, speech_spans)
+        return words
+    finally:
+        if speech_wav is not None and speech_wav.is_file():
+            speech_wav.unlink()
 
 
-def run_transcribe(workdir: Path, *, force: bool = False) -> None:
+def _resolve_speech_spans(wav_path: Path, *, vad: bool) -> list[tuple[float, float]] | None:
+    """Return VAD speech spans, or None to transcribe the full file."""
+    if not vad:
+        return None
+    if not vad_deps_available():
+        print(
+            "warning: VAD skipped — numpy/onnxruntime not installed "
+            "(pip install 'ksub[vad]'); transcribing the full audio",
+            file=sys.stderr,
+        )
+        return None
+
+    spans = collect_speech_spans(wav_path)
+    if not spans:
+        print(
+            "warning: VAD found no speech — transcribing the full audio",
+            file=sys.stderr,
+        )
+        return None
+
+    speech_s = sum(end - start for start, end in spans)
+    print(f"VAD: {len(spans)} speech region(s), {speech_s:.1f}s kept")
+    return spans
+
+
+def run_transcribe(workdir: Path, *, force: bool = False, vad: bool = True) -> None:
     """Run the transcribe stage: audio.wav → words.json."""
     words_path = words_json_path(workdir)
     wav_path = audio_wav_path(workdir)
@@ -173,10 +233,15 @@ def run_transcribe(workdir: Path, *, force: bool = False) -> None:
             raise SystemExit(1)
 
     engine = check_prerequisites()
+    speech_spans = _resolve_speech_spans(wav_path, vad=vad)
+
     if engine == "mlx":
-        words = _transcribe_mlx(wav_path)
+        clip_timestamps = (
+            flatten_clip_timestamps(speech_spans) if speech_spans else None
+        )
+        words = _transcribe_mlx(wav_path, clip_timestamps=clip_timestamps)
     else:
-        words = _transcribe_whisper_cpp(wav_path, workdir)
+        words = _transcribe_whisper_cpp(wav_path, workdir, speech_spans=speech_spans)
 
     try:
         normalize_words(words)

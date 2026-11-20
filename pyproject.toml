@@ -14,9 +14,10 @@ dependencies = [
 
 [project.optional-dependencies]
 gemini = ["google-genai>=1.0"]
-mlx = ["mlx-whisper>=0.4"]
+vad = ["numpy>=1.24", "onnxruntime>=1.17"]
+mlx = ["mlx-whisper>=0.4", "numpy>=1.24", "onnxruntime>=1.17"]
 dev = ["pytest>=8.0"]
-all = ["google-genai>=1.0", "mlx-whisper>=0.4"]
+all = ["google-genai>=1.0", "mlx-whisper>=0.4", "numpy>=1.24", "onnxruntime>=1.17"]
 
 [project.scripts]
 ksub = "ksub.cli:main"
